@@ -27,16 +27,18 @@
 #include "lwip/sockets.h"
 
 #define BOOT_BUTTON_GPIO GPIO_NUM_0
-#define LED_BUILTIN_GPIO GPIO_NUM_2
+#define LED_BUILTIN GPIO_NUM_2 // Typische Build-in LED bei Standard ESP32 DevBoards
 #define CONFIG_NAMESPACE "wifi_cfg"
 #define MAX_SSID_LEN 32
 #define MAX_PASS_LEN 64
-#define SETUP_AP_SSID "ESP32-Setup"
+#define MAX_FIELD_LEN 128
+#define SETUP_AP_BASE_SSID "ESP32-Setup"
+#define SETUP_AP_MAX_CONN 4
 #define AP_NETIF_KEY "WIFI_AP_DEF"
 #define STA_NETIF_KEY "WIFI_STA_DEF"
 #define DNS_PORT 53
 #define HTTP_PORT 80
-#define BUTTON_LONG_PRESS_MS 10000
+#define BUTTON_HOLD_SECONDS 10 // Geändert auf 10 Sekunden
 #define BUTTON_POLL_MS 100
 
 #if defined(IP_NAPT) && (IP_NAPT)
@@ -46,16 +48,16 @@
 #endif
 
 typedef enum {
-    MODE_SETUP_PORTAL = 0,
-    MODE_WIFI_REPEATER = 1,
+    MODE_CONFIG = 0,
+    MODE_ROUTER = 1,
 } app_mode_t;
 
 typedef struct {
     char target_ssid[MAX_SSID_LEN + 1];
     char target_pass[MAX_PASS_LEN + 1];
-    char repeater_ssid[MAX_SSID_LEN + 1];
-    char repeater_pass[MAX_PASS_LEN + 1];
-} wifi_config_t;
+    char hotspot_ssid[MAX_SSID_LEN + 1];
+    char hotspot_pass[MAX_PASS_LEN + 1];
+} app_config_t;
 
 typedef struct __attribute__((packed)) {
     uint16_t id;
@@ -66,269 +68,340 @@ typedef struct __attribute__((packed)) {
     uint16_t arcount;
 } dns_header_t;
 
-static const char *TAG = "ESP32-Portal";
+static const char *TAG = "wifi_portal";
 
-static esp_netif_t *s_ap_netif = NULL;
-static esp_netif_t *s_sta_netif = NULL;
-static httpd_handle_t s_http_server = NULL;
-static TaskHandle_t s_dns_task = NULL;
-static TaskHandle_t s_button_task = NULL;
-static volatile bool s_restart_pending = false;
-static volatile app_mode_t s_mode = MODE_SETUP_PORTAL;
-static volatile bool s_portal_active = true;
-static volatile bool s_led_blink = false;
+static esp_netif_t *s_ap_netif;
+static esp_netif_t *s_sta_netif;
+static httpd_handle_t s_http_server;
+static TaskHandle_t s_dns_task;
+static TaskHandle_t s_button_task;
+static volatile bool s_restart_pending;
+static volatile app_mode_t s_mode;
 
-// ============================================================================
-// LED Control
-// ============================================================================
+static void restart_later(void *arg);
+static void start_router_mode(const app_config_t *cfg);
+static void start_config_portal(void);
 
-static void led_init(void) {
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << LED_BUILTIN_GPIO),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&io_conf);
+static void safe_copy(char *dst, size_t dst_size, const char *src) {
+    if (!dst || dst_size == 0) {
+        return;
+    }
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    snprintf(dst, dst_size, "%s", src);
 }
 
-static void led_set(bool on) {
-    gpio_set_level(LED_BUILTIN_GPIO, on ? 1 : 0);
-}
-
-static void led_blink_task(void *arg) {
-    while (1) {
-        if (s_led_blink) {
-            led_set(1);
-            vTaskDelay(100 / portTICK_PERIOD_MS);
-            led_set(0);
-            vTaskDelay(100 / portTICK_PERIOD_MS);
-        } else {
-            led_set(0);
-            vTaskDelay(500 / portTICK_PERIOD_MS);
-        }
+static void trim_trailing_spaces(char *s) {
+    if (!s) {
+        return;
+    }
+    size_t len = strlen(s);
+    while (len > 0 && isspace((unsigned char)s[len - 1])) {
+        s[--len] = '\0';
     }
 }
 
-// ============================================================================
-// NVS Config
-// ============================================================================
+static void trim_leading_spaces(char *s) {
+    if (!s) {
+        return;
+    }
+    size_t i = 0;
+    while (s[i] && isspace((unsigned char)s[i])) {
+        i++;
+    }
+    if (i > 0) {
+        memmove(s, s + i, strlen(s + i) + 1);
+    }
+}
 
-static esp_err_t config_load(wifi_config_t *cfg) {
+static void trim_whitespace(char *s) {
+    trim_leading_spaces(s);
+    trim_trailing_spaces(s);
+}
+
+static void url_decode(char *dst, size_t dst_size, const char *src) {
+    if (!dst || dst_size == 0) {
+        return;
+    }
+    size_t di = 0;
+    for (size_t si = 0; src && src[si] != '\0'; ++si) {
+        if (di + 1 >= dst_size) {
+            break;
+        }
+        if (src[si] == '+') {
+            dst[di++] = ' ';
+        } else if (src[si] == '%' && isxdigit((unsigned char)src[si + 1]) && isxdigit((unsigned char)src[si + 2])) {
+            char hex[3] = { src[si + 1], src[si + 2], '\0' };
+            dst[di++] = (char)strtol(hex, NULL, 16);
+            si += 2;
+        } else {
+            dst[di++] = src[si];
+        }
+    }
+    dst[di] = '\0';
+}
+
+static esp_err_t form_get_value(const char *body, const char *key, char *out, size_t out_size) {
+    if (!body || !key || !out || out_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    char encoded[MAX_FIELD_LEN + 1];
+    esp_err_t err = httpd_query_key_value(body, key, encoded, sizeof(encoded));
+    if (err != ESP_OK) {
+        return err;
+    }
+    url_decode(out, out_size, encoded);
+    trim_whitespace(out);
+    return ESP_OK;
+}
+
+static bool config_is_valid(const app_config_t *cfg) {
+    if (!cfg) {
+        return false;
+    }
+    if (cfg->target_ssid[0] == '\0' || cfg->hotspot_ssid[0] == '\0') {
+        return false;
+    }
+    size_t hotspot_pass_len = strlen(cfg->hotspot_pass);
+    if (hotspot_pass_len != 0 && hotspot_pass_len < 8) {
+        return false;
+    }
+    if (strlen(cfg->target_ssid) > MAX_SSID_LEN || strlen(cfg->hotspot_ssid) > MAX_SSID_LEN) {
+        return false;
+    }
+    if (strlen(cfg->target_pass) > MAX_PASS_LEN || strlen(cfg->hotspot_pass) > MAX_PASS_LEN) {
+        return false;
+    }
+    return true;
+}
+
+static esp_err_t save_config_to_nvs(const app_config_t *cfg) {
+    if (!config_is_valid(cfg)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t handle;
+    ESP_RETURN_ON_ERROR(nvs_open(CONFIG_NAMESPACE, NVS_READWRITE, &handle), TAG, "nvs_open failed");
+    esp_err_t err = nvs_set_str(handle, "target_ssid", cfg->target_ssid);
+    if (err == ESP_OK) err = nvs_set_str(handle, "target_pass", cfg->target_pass);
+    if (err == ESP_OK) err = nvs_set_str(handle, "hotspot_ssid", cfg->hotspot_ssid);
+    if (err == ESP_OK) err = nvs_set_str(handle, "hotspot_pass", cfg->hotspot_pass);
+    
+    // Nach dem erfolgreichen Speichern im Webportal schalten wir den "force_portal"-Modus wieder ab
+    if (err == ESP_OK) err = nvs_set_u8(handle, "force_portal", 0);
+    
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    return err;
+}
+
+static esp_err_t load_config_from_nvs(app_config_t *cfg) {
+    if (!cfg) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(cfg, 0, sizeof(*cfg));
     nvs_handle_t handle;
     esp_err_t err = nvs_open(CONFIG_NAMESPACE, NVS_READONLY, &handle);
     if (err != ESP_OK) {
-        memset(cfg, 0, sizeof(wifi_config_t));
-        snprintf(cfg->repeater_ssid, MAX_SSID_LEN + 1, "%s", SETUP_AP_SSID);
-        snprintf(cfg->repeater_pass, MAX_PASS_LEN + 1, "12345678");
-        return ESP_OK;
+        return err;
     }
+    size_t len = sizeof(cfg->target_ssid);
+    err = nvs_get_str(handle, "target_ssid", cfg->target_ssid, &len);
+    if (err != ESP_OK) goto done;
+    len = sizeof(cfg->target_pass);
+    err = nvs_get_str(handle, "target_pass", cfg->target_pass, &len);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) goto done;
+    if (err == ESP_ERR_NVS_NOT_FOUND) cfg->target_pass[0] = '\0';
+    len = sizeof(cfg->hotspot_ssid);
+    err = nvs_get_str(handle, "hotspot_ssid", cfg->hotspot_ssid, &len);
+    if (err != ESP_OK) goto done;
+    len = sizeof(cfg->hotspot_pass);
+    err = nvs_get_str(handle, "hotspot_pass", cfg->hotspot_pass, &len);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) goto done;
+    if (err == ESP_ERR_NVS_NOT_FOUND) cfg->hotspot_pass[0] = '\0';
+    err = config_is_valid(cfg) ? ESP_OK : ESP_ERR_INVALID_STATE;
 
-    size_t len = MAX_SSID_LEN + 1;
-    nvs_get_str(handle, "target_ssid", cfg->target_ssid, &len);
-    len = MAX_PASS_LEN + 1;
-    nvs_get_str(handle, "target_pass", cfg->target_pass, &len);
-    len = MAX_SSID_LEN + 1;
-    nvs_get_str(handle, "repeater_ssid", cfg->repeater_ssid, &len);
-    len = MAX_PASS_LEN + 1;
-    nvs_get_str(handle, "repeater_pass", cfg->repeater_pass, &len);
-    
+done:
     nvs_close(handle);
-    return ESP_OK;
+    return err;
 }
 
-static esp_err_t config_save(const wifi_config_t *cfg) {
+static esp_err_t clear_config_nvs(void) {
     nvs_handle_t handle;
     esp_err_t err = nvs_open(CONFIG_NAMESPACE, NVS_READWRITE, &handle);
-    if (err != ESP_OK) return err;
-
-    nvs_set_str(handle, "target_ssid", cfg->target_ssid);
-    nvs_set_str(handle, "target_pass", cfg->target_pass);
-    nvs_set_str(handle, "repeater_ssid", cfg->repeater_ssid);
-    nvs_set_str(handle, "repeater_pass", cfg->repeater_pass);
-    
-    nvs_commit(handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_erase_all(handle); // Löscht alle Werte inkl. force_portal
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
     nvs_close(handle);
-    return ESP_OK;
+    return err;
 }
 
-static esp_err_t config_reset(void) {
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(CONFIG_NAMESPACE, NVS_READWRITE, &handle);
-    if (err != ESP_OK) return err;
-    nvs_erase_all(handle);
-    nvs_commit(handle);
-    nvs_close(handle);
-    return ESP_OK;
+static void get_setup_ap_ssid(char *out, size_t out_size) {
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
+    snprintf(out, out_size, "%s-%02X%02X", SETUP_AP_BASE_SSID, mac[4], mac[5]);
 }
 
-// ============================================================================
-// DNS Captive Portal
-// ============================================================================
+static void wifi_log_sta_credentials(const app_config_t *cfg) {
+    ESP_LOGI(TAG, "Target SSID: %s", cfg->target_ssid);
+    ESP_LOGI(TAG, "Hotspot SSID: %s", cfg->hotspot_ssid);
+}
 
-static void dns_task(void *arg) {
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock < 0) {
-        ESP_LOGE(TAG, "DNS: Failed to create socket");
-        vTaskDelete(NULL);
+static void set_ap_config_from_credentials(const char *ssid, const char *pass) {
+    wifi_config_t ap_cfg = { 0 };
+    safe_copy((char *)ap_cfg.ap.ssid, sizeof(ap_cfg.ap.ssid), ssid);
+    ap_cfg.ap.ssid_len = strlen((char *)ap_cfg.ap.ssid);
+    safe_copy((char *)ap_cfg.ap.password, sizeof(ap_cfg.ap.password), pass);
+    ap_cfg.ap.channel = 1;
+    ap_cfg.ap.max_connection = SETUP_AP_MAX_CONN;
+    ap_cfg.ap.beacon_interval = 100;
+    if (ap_cfg.ap.password[0] == '\0') {
+        ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
+    } else {
+        ap_cfg.ap.authmode = WIFI_AUTH_WPA_WPA2_PSK;
+    }
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
+}
+
+static void set_sta_config_from_credentials(const app_config_t *cfg) {
+    wifi_config_t sta_cfg = { 0 };
+    safe_copy((char *)sta_cfg.sta.ssid, sizeof(sta_cfg.sta.ssid), cfg->target_ssid);
+    safe_copy((char *)sta_cfg.sta.password, sizeof(sta_cfg.sta.password), cfg->target_pass);
+    sta_cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    sta_cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+    sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    if (sta_cfg.sta.password[0] == '\0') {
+        sta_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    }
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
+}
+
+static void start_dns_captive_task(void *arg);
+static void start_dns_proxy_task(void *arg);
+
+static void stop_dns_task(void) {
+    if (s_dns_task != NULL) {
+        TaskHandle_t task = s_dns_task;
+        s_dns_task = NULL;
+        vTaskDelete(task);
+    }
+}
+
+static void restart_later(void *arg) {
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+}
+
+static void schedule_restart(void) {
+    if (s_restart_pending) {
         return;
     }
-
-    struct sockaddr_in addr = {
-        .sin_family = AF_INET,
-        .sin_port = htons(DNS_PORT),
-        .sin_addr.s_addr = htonl(INADDR_ANY),
-    };
-
-    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        ESP_LOGE(TAG, "DNS: Failed to bind");
-        close(sock);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    uint8_t buffer[512];
-    struct sockaddr_in client_addr;
-    socklen_t client_addr_len;
-
-    while (s_portal_active) {
-        client_addr_len = sizeof(client_addr);
-        int n = recvfrom(sock, buffer, sizeof(buffer), 0, (struct sockaddr *)&client_addr, &client_addr_len);
-        
-        if (n > sizeof(dns_header_t)) {
-            dns_header_t *req = (dns_header_t *)buffer;
-            dns_header_t *resp = (dns_header_t *)buffer;
-            
-            resp->flags = htons(0x8180);
-            resp->ancount = htons(1);
-
-            int offset = sizeof(dns_header_t);
-            while (offset < n && buffer[offset] != 0) {
-                offset += buffer[offset] + 1;
-            }
-            offset++;
-
-            offset += 4;
-            memmove(buffer + offset + 16, buffer + offset, n - offset);
-            n += 16;
-
-            uint8_t *answer = buffer + offset;
-            answer[0] = 0xc0;
-            answer[1] = 0x0c;
-            answer[2] = 0x00;
-            answer[3] = 0x01;
-            answer[4] = 0x00;
-            answer[5] = 0x01;
-            answer[6] = 0x00;
-            answer[7] = 0x00;
-            answer[8] = 0x00;
-            answer[9] = 0x3c;
-            answer[10] = 0x00;
-            answer[11] = 0x04;
-            answer[12] = 192;
-            answer[13] = 168;
-            answer[14] = 4;
-            answer[15] = 1;
-
-            sendto(sock, buffer, n, 0, (struct sockaddr *)&client_addr, client_addr_len);
-        }
-    }
-
-    close(sock);
-    vTaskDelete(NULL);
-}
-
-// ============================================================================
-// HTTP Server & Captive Portal
-// ============================================================================
-
-static esp_err_t http_get_handler(httpd_req_t *req) {
-    wifi_config_t cfg;
-    config_load(&cfg);
-
-    const char *html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width'><title>WiFi Repeater Setup</title><style>body{font-family:Arial;max-width:500px;margin:50px auto;background:#f0f0f0;padding:20px}h1{color:#333}input{width:100%;padding:10px;margin:10px 0;border:1px solid #ccc;box-sizing:border-box}.btn{width:100%;padding:12px;background:#007bff;color:white;border:none;border-radius:4px;cursor:pointer;font-size:16px}.btn:hover{background:#0056b3}.info{background:#e7f3ff;padding:10px;border-left:4px solid #2196F3;margin-bottom:20px}</style></head><body><h1>🌐 WiFi Repeater Setup</h1><div class='info'>Current Mode: <b>Setup Portal</b><br>LED is blinking = Portal Active</div><form method='POST'><fieldset><legend>🎯 Target Network</legend><label>Target WiFi SSID:</label><input type='text' name='target_ssid' value='%s' maxlength='32' required><label>Target WiFi Password:</label><input type='password' name='target_pass' value='%s' maxlength='64'></fieldset><fieldset><legend>📡 Repeater Network</legend><label>Repeater SSID:</label><input type='text' name='repeater_ssid' value='%s' maxlength='32' required><label>Repeater Password:</label><input type='password' name='repeater_pass' value='%s' maxlength='64' required></fieldset><button type='submit' class='btn'>💾 Save & Restart</button></form><hr><p style='font-size:12px;color:#666'><b>Boot Button:</b> Short press = Toggle Portal | Long press (10s) = Reset All Settings</p></body></html>";
-
-    char response[2048];
-    snprintf(response, sizeof(response), html,
-             cfg.target_ssid, cfg.target_pass,
-             cfg.repeater_ssid, cfg.repeater_pass);
-
-    httpd_resp_send(req, response, strlen(response));
-    return ESP_OK;
-}
-
-static esp_err_t http_post_handler(httpd_req_t *req) {
-    char buffer[512];
-    int recv_len = httpd_req_recv(req, buffer, sizeof(buffer) - 1);
-    if (recv_len <= 0) {
-        return ESP_FAIL;
-    }
-    buffer[recv_len] = '\0';
-
-    wifi_config_t cfg;
-    config_load(&cfg);
-
-    char *p = buffer;
-    while (*p) {
-        if (strncmp(p, "target_ssid=", 12) == 0) {
-            p += 12;
-            int i = 0;
-            while (*p && *p != '&' && i < MAX_SSID_LEN) {
-                cfg.target_ssid[i++] = *p++;
-            }
-            cfg.target_ssid[i] = '\0';
-        } else if (strncmp(p, "target_pass=", 12) == 0) {
-            p += 12;
-            int i = 0;
-            while (*p && *p != '&' && i < MAX_PASS_LEN) {
-                cfg.target_pass[i++] = *p++;
-            }
-            cfg.target_pass[i] = '\0';
-        } else if (strncmp(p, "repeater_ssid=", 14) == 0) {
-            p += 14;
-            int i = 0;
-            while (*p && *p != '&' && i < MAX_SSID_LEN) {
-                cfg.repeater_ssid[i++] = *p++;
-            }
-            cfg.repeater_ssid[i] = '\0';
-        } else if (strncmp(p, "repeater_pass=", 14) == 0) {
-            p += 14;
-            int i = 0;
-            while (*p && *p != '&' && i < MAX_PASS_LEN) {
-                cfg.repeater_pass[i++] = *p++;
-            }
-            cfg.repeater_pass[i] = '\0';
-        }
-        while (*p && *p != '&') p++;
-        if (*p) p++;
-    }
-
-    config_save(&cfg);
-    ESP_LOGI(TAG, "Config saved. Restarting...");
-
-    httpd_resp_send(req, "Saved! Restarting...", HTTPD_RESP_USE_STRLEN);
     s_restart_pending = true;
-    return ESP_OK;
+    xTaskCreate(restart_later, "restart_later", 2048, NULL, tskIDLE_PRIORITY + 1, NULL);
 }
 
-static httpd_uri_t uri_get = {
-    .uri = "/",
-    .method = HTTP_GET,
-    .handler = http_get_handler,
-};
+static void stop_http_server(void) {
+    if (s_http_server) {
+        httpd_stop(s_http_server);
+        s_http_server = NULL;
+    }
+}
 
-static httpd_uri_t uri_post = {
-    .uri = "/",
-    .method = HTTP_POST,
-    .handler = http_post_handler,
-};
+static esp_err_t root_get_handler(httpd_req_t *req) {
+    const char *page =
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>ESP32 Config</title>"
+        "<style>body{font-family:system-ui,sans-serif;max-width:720px;margin:24px auto;padding:0 16px;}"
+        "input{width:100%;padding:10px;margin:6px 0 14px;box-sizing:border-box;}"
+        "button{padding:12px 16px;width:100%;}label{font-weight:600;}</style></head><body>"
+        "<h1>ESP32 Wi-Fi Setup</h1>"
+        "<p>Target WLAN verbindet der ESP32 als Station. Das Hotspot-WLAN wird danach bereitgestellt.</p>"
+        "<form method='POST' action='/save'>"
+        "<label>Target SSID</label><input name='target_ssid' maxlength='32' required>"
+        "<label>Target Passwort</label><input name='target_pass' maxlength='64' type='password'>"
+        "<label>Hotspot SSID</label><input name='hotspot_ssid' maxlength='32' required>"
+        "<label>Hotspot Passwort (leer = offen, sonst 8-63 Zeichen)</label><input name='hotspot_pass' maxlength='64' type='password'>"
+        "<button type='submit'>Speichern und neu starten</button>"
+        "</form></body></html>";
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, page, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t save_post_handler(httpd_req_t *req) {
+    const size_t body_len = req->content_len;
+    char *body = calloc(1, body_len + 1);
+    if (!body) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+    }
+    size_t received = 0;
+    while (received < body_len) {
+        int r = httpd_req_recv(req, body + received, body_len - received);
+        if (r <= 0) {
+            free(body);
+            if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+                return httpd_resp_send_408(req);
+            }
+            return ESP_FAIL;
+        }
+        received += (size_t)r;
+    }
+
+    app_config_t cfg = { 0 };
+    ESP_ERROR_CHECK_WITHOUT_ABORT(form_get_value(body, "target_ssid", cfg.target_ssid, sizeof(cfg.target_ssid)));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(form_get_value(body, "target_pass", cfg.target_pass, sizeof(cfg.target_pass)));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(form_get_value(body, "hotspot_ssid", cfg.hotspot_ssid, sizeof(cfg.hotspot_ssid)));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(form_get_value(body, "hotspot_pass", cfg.hotspot_pass, sizeof(cfg.hotspot_pass)));
+    free(body);
+
+    if (!config_is_valid(&cfg)) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid config");
+    }
+
+    esp_err_t err = save_config_to_nvs(&cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save_config_to_nvs failed: %s", esp_err_to_name(err));
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Save failed");
+    }
+
+    const char *response =
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta http-equiv='refresh' content='2; url=/'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>Gespeichert</title></head><body>"
+        "<h1>Gespeichert</h1><p>Neustart folgt.</p></body></html>";
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    err = httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+    if (err == ESP_OK) {
+        schedule_restart();
+    }
+    return err;
+}
+
+static esp_err_t redirect_handler(httpd_req_t *req, httpd_err_code_t err) {
+    (void)err;
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_send(req, "", 0);
+    return ESP_OK;
+}
 
 static httpd_handle_t start_http_server(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = HTTP_PORT;
     config.lru_purge_enable = true;
-    config.max_open_sockets = 4;
+    config.recv_wait_timeout = 10;
+    config.send_wait_timeout = 10;
+    config.max_open_sockets = 8;
+    config.stack_size = 8192;
 
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) != ESP_OK) {
@@ -336,200 +409,443 @@ static httpd_handle_t start_http_server(void) {
         return NULL;
     }
 
-    httpd_register_uri_handler(server, &uri_get);
-    httpd_register_uri_handler(server, &uri_post);
+    static const httpd_uri_t root = {
+        .uri = "/",
+        .method = HTTP_GET,
+        .handler = root_get_handler,
+        .user_ctx = NULL,
+    };
+    static const httpd_uri_t save = {
+        .uri = "/save",
+        .method = HTTP_POST,
+        .handler = save_post_handler,
+        .user_ctx = NULL,
+    };
+    static const httpd_uri_t probes[] = {
+        { .uri = "/generate_204", .method = HTTP_GET, .handler = root_get_handler },
+        { .uri = "/gen_204", .method = HTTP_GET, .handler = root_get_handler },
+        { .uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = root_get_handler },
+        { .uri = "/ncsi.txt", .method = HTTP_GET, .handler = root_get_handler },
+        { .uri = "/connecttest.txt", .method = HTTP_GET, .handler = root_get_handler },
+    };
 
-    ESP_LOGI(TAG, "HTTP server started on port %d", HTTP_PORT);
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &root));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &save));
+    for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); ++i) {
+        ESP_ERROR_CHECK(httpd_register_uri_handler(server, &probes[i]));
+    }
+    ESP_ERROR_CHECK(httpd_register_err_handler(server, HTTPD_404_NOT_FOUND, redirect_handler));
     return server;
 }
 
-// ============================================================================
-// WiFi Event Handler
-// ============================================================================
-
-static void wifi_event_handler(void *arg, esp_event_base_t event_base,
-                               int32_t event_id, void *event_data) {
-    if (event_base == WIFI_EVENT) {
-        if (event_id == WIFI_EVENT_STA_START) {
-            esp_wifi_connect();
-        } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
-            esp_wifi_connect();
-        } else if (event_id == WIFI_EVENT_AP_STACONNECTED) {
-            wifi_event_ap_staconnected_t *event = (wifi_event_ap_staconnected_t *)event_data;
-            ESP_LOGI(TAG, "Station joined AP, MAC: %02x:%02x:%02x:%02x:%02x:%02x",
-                     event->mac[0], event->mac[1], event->mac[2],
-                     event->mac[3], event->mac[4], event->mac[5]);
+static esp_err_t dns_question_end(const uint8_t *pkt, size_t len, size_t *offset) {
+    if (!pkt || len < sizeof(dns_header_t) + 5 || !offset) {
+        return ESP_FAIL;
+    }
+    size_t pos = sizeof(dns_header_t);
+    while (pos < len && pkt[pos] != 0) {
+        uint8_t label_len = pkt[pos];
+        if ((label_len & 0xC0) != 0) {
+            return ESP_FAIL;
         }
-    } else if (event_base == IP_EVENT) {
-        if (event_id == IP_EVENT_STA_GOT_IP) {
-            ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-            ESP_LOGI(TAG, "STA got IP: " IPSTR, IP2STR(&event->ip_info.ip));
-            s_mode = MODE_WIFI_REPEATER;
-            s_led_blink = false;
+        pos += (size_t)label_len + 1;
+    }
+    if (pos + 5 > len) {
+        return ESP_FAIL;
+    }
+    *offset = pos + 5;
+    return ESP_OK;
+}
 
-#if APP_HAS_NAPT
-            esp_netif_ip_info_t ap_ip;
-            esp_netif_get_ip_info(s_ap_netif, &ap_ip);
-            ip_napt_enable(ap_ip.ip.addr, 1);
-            ESP_LOGI(TAG, "NAPT enabled on AP IP: " IPSTR, IP2STR(&ap_ip.ip));
-#endif
+static size_t dns_build_captive_response(const uint8_t *query, size_t query_len, uint8_t *resp, size_t resp_size, uint32_t ap_ip) {
+    size_t question_end = 0;
+    if (dns_question_end(query, query_len, &question_end) != ESP_OK) {
+        return 0;
+    }
+    if (resp_size < question_end + 16) {
+        return 0;
+    }
+    memcpy(resp, query, question_end);
+
+    dns_header_t *h = (dns_header_t *)resp;
+    h->flags = htons(0x8180);
+    h->ancount = htons(1);
+    h->nscount = 0;
+    h->arcount = 0;
+
+    size_t off = question_end;
+    resp[off++] = 0xC0;
+    resp[off++] = 0x0C;
+    resp[off++] = 0x00;
+    resp[off++] = 0x01;
+    resp[off++] = 0x00;
+    resp[off++] = 0x01;
+    resp[off++] = 0x00;
+    resp[off++] = 0x00;
+    resp[off++] = 0x00;
+    resp[off++] = 0x3C;
+    resp[off++] = 0x00;
+    resp[off++] = 0x04;
+    memcpy(&resp[off], &ap_ip, sizeof(ap_ip));
+    off += sizeof(ap_ip);
+    return off;
+}
+
+static bool get_ap_ip(uint32_t *ip_out) {
+    if (!s_ap_netif || !ip_out) {
+        return false;
+    }
+    esp_netif_ip_info_t ip_info = { 0 };
+    if (esp_netif_get_ip_info(s_ap_netif, &ip_info) != ESP_OK) {
+        return false;
+    }
+    *ip_out = ip_info.ip.addr;
+    return true;
+}
+
+static bool get_sta_dns(uint32_t *ip_out) {
+    if (!s_sta_netif || !ip_out) {
+        return false;
+    }
+    esp_netif_dns_info_t dns = { 0 };
+    if (esp_netif_get_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &dns) != ESP_OK) {
+        return false;
+    }
+    if (dns.ip.type != IPADDR_TYPE_V4) {
+        return false;
+    }
+    if (dns.ip.u_addr.ip4.addr == 0) {
+        return false;
+    }
+    *ip_out = dns.ip.u_addr.ip4.addr;
+    return true;
+}
+
+static void dns_captive_task(void *arg) {
+    (void)arg;
+    uint8_t rx_buf[512];
+    uint8_t tx_buf[512];
+    while (1) {
+        int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+        if (sock < 0) {
+            ESP_LOGE(TAG, "DNS socket create failed: errno=%d", errno);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
         }
+
+        struct sockaddr_in bind_addr = {
+            .sin_family = AF_INET,
+            .sin_port = htons(DNS_PORT),
+            .sin_addr.s_addr = htonl(INADDR_ANY),
+        };
+        if (bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) != 0) {
+            ESP_LOGE(TAG, "DNS bind failed: errno=%d", errno);
+            close(sock);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        ESP_LOGI(TAG, "DNS captive server started");
+        while (s_mode == MODE_CONFIG && !s_restart_pending) {
+            struct sockaddr_in from_addr;
+            socklen_t from_len = sizeof(from_addr);
+            int len = recvfrom(sock, rx_buf, sizeof(rx_buf), 0, (struct sockaddr *)&from_addr, &from_len);
+            if (len <= 0) {
+                continue;
+            }
+            uint32_t ap_ip = 0;
+            if (!get_ap_ip(&ap_ip)) {
+                continue;
+            }
+            size_t resp_len = dns_build_captive_response(rx_buf, (size_t)len, tx_buf, sizeof(tx_buf), ap_ip);
+            if (resp_len == 0) {
+                continue;
+            }
+            sendto(sock, tx_buf, resp_len, 0, (struct sockaddr *)&from_addr, from_len);
+        }
+        close(sock);
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
-static void start_setup_portal(void) {
-    ESP_LOGI(TAG, "Starting Setup Portal Mode");
-    s_mode = MODE_SETUP_PORTAL;
-    s_led_blink = true;
-    s_portal_active = true;
+static void dns_proxy_task(void *arg) {
+    (void)arg;
+    uint8_t rx_buf[512];
+    uint8_t tx_buf[512];
+    while (1) {
+        int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+        if (sock < 0) {
+            ESP_LOGE(TAG, "DNS proxy socket create failed: errno=%d", errno);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        struct sockaddr_in bind_addr = {
+            .sin_family = AF_INET,
+            .sin_port = htons(DNS_PORT),
+            .sin_addr.s_addr = htonl(INADDR_ANY),
+        };
+        if (bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) != 0) {
+            ESP_LOGE(TAG, "DNS proxy bind failed: errno=%d", errno);
+            close(sock);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
 
-    esp_wifi_disconnect();
+        ESP_LOGI(TAG, "DNS proxy started");
+        while (s_mode == MODE_ROUTER && !s_restart_pending) {
+            struct sockaddr_in client_addr;
+            socklen_t client_len = sizeof(client_addr);
+            int len = recvfrom(sock, rx_buf, sizeof(rx_buf), 0, (struct sockaddr *)&client_addr, &client_len);
+            if (len <= 0) {
+                continue;
+            }
 
-    wifi_config_t wifi_config;
-    memset(&wifi_config, 0, sizeof(wifi_config));
-    strlcpy((char *)wifi_config.ssid, SETUP_AP_SSID, sizeof(wifi_config.ssid));
-    strlcpy((char *)wifi_config.password, "12345678", sizeof(wifi_config.password));
-    wifi_config.authmode = WIFI_AUTH_WPA2_PSK;
-    wifi_config.max_connection = 4;
+            uint32_t upstream_ip = 0;
+            if (!get_sta_dns(&upstream_ip)) {
+                upstream_ip = inet_addr("1.1.1.1");
+            }
 
-    esp_wifi_set_config(WIFI_IF_AP, &wifi_config);
-    esp_wifi_set_mode(WIFI_MODE_AP);
-    esp_wifi_start();
-
-    if (!s_http_server) {
-        s_http_server = start_http_server();
-    }
-
-    if (!s_dns_task) {
-        xTaskCreate(dns_task, "dns_task", 2048, NULL, 5, &s_dns_task);
+            int upstream = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+            if (upstream < 0) {
+                continue;
+            }
+            struct timeval tv = {.tv_sec = 3, .tv_usec = 0};
+            setsockopt(upstream, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            struct sockaddr_in upstream_addr = {
+                .sin_family = AF_INET,
+                .sin_port = htons(DNS_PORT),
+                .sin_addr.s_addr = upstream_ip,
+            };
+            if (connect(upstream, (struct sockaddr *)&upstream_addr, sizeof(upstream_addr)) != 0) {
+                close(upstream);
+                continue;
+            }
+            if (send(upstream, rx_buf, len, 0) < 0) {
+                close(upstream);
+                continue;
+            }
+            int resp_len = recv(upstream, tx_buf, sizeof(tx_buf), 0);
+            close(upstream);
+            if (resp_len > 0) {
+                sendto(sock, tx_buf, resp_len, 0, (struct sockaddr *)&client_addr, client_len);
+            }
+        }
+        close(sock);
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
-static void start_wifi_repeater(void) {
-    wifi_config_t cfg;
-    config_load(&cfg);
-
-    if (cfg.target_ssid[0] == '\0') {
-        ESP_LOGW(TAG, "No target SSID configured, starting portal");
-        start_setup_portal();
+static void start_dns_captive_task(void *arg) {
+    (void)arg;
+    if (s_dns_task != NULL) {
         return;
     }
-
-    ESP_LOGI(TAG, "Starting WiFi Repeater Mode");
-    s_mode = MODE_WIFI_REPEATER;
-    s_led_blink = false;
-    s_portal_active = false;
-
-    if (s_http_server) {
-        httpd_stop(s_http_server);
-        s_http_server = NULL;
-    }
-
-    if (s_dns_task) {
-        vTaskDelete(s_dns_task);
-        s_dns_task = NULL;
-    }
-
-    wifi_config_t sta_config;
-    memset(&sta_config, 0, sizeof(sta_config));
-    strlcpy((char *)sta_config.ssid, cfg.target_ssid, sizeof(sta_config.ssid));
-    strlcpy((char *)sta_config.password, cfg.target_pass, sizeof(sta_config.password));
-
-    esp_wifi_set_config(WIFI_IF_STA, &sta_config);
-
-    wifi_config_t ap_config;
-    memset(&ap_config, 0, sizeof(ap_config));
-    strlcpy((char *)ap_config.ssid, cfg.repeater_ssid, sizeof(ap_config.ssid));
-    strlcpy((char *)ap_config.password, cfg.repeater_pass, sizeof(ap_config.password));
-    ap_config.authmode = WIFI_AUTH_WPA2_PSK;
-    ap_config.max_connection = 4;
-
-    esp_wifi_set_config(WIFI_IF_AP, &ap_config);
-    esp_wifi_set_mode(WIFI_MODE_APSTA);
-    esp_wifi_start();
-
-    ESP_LOGI(TAG, "Target SSID: %s", cfg.target_ssid);
-    ESP_LOGI(TAG, "Repeater SSID: %s", cfg.repeater_ssid);
+    xTaskCreate(dns_captive_task, "dns_captive", 4096, NULL, tskIDLE_PRIORITY + 2, &s_dns_task);
 }
 
-// ============================================================================
-// Button Handler
-// ============================================================================
+static void start_dns_proxy_task(void *arg) {
+    (void)arg;
+    if (s_dns_task != NULL) {
+        return;
+    }
+    xTaskCreate(dns_proxy_task, "dns_proxy", 4096, NULL, tskIDLE_PRIORITY + 2, &s_dns_task);
+}
 
-static void button_task(void *arg) {
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << BOOT_BUTTON_GPIO),
+static void ensure_button_task(void);
+
+static void button_watch_task(void *arg) {
+    (void)arg;
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << BOOT_BUTTON_GPIO,
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
-    gpio_config(&io_conf);
+    gpio_config(&io);
 
-    uint32_t press_duration = 0;
+    int64_t pressed_since = -1;
+    bool handled_long_press = false;
 
     while (1) {
-        if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
-            press_duration += BUTTON_POLL_MS;
-            
-            if (press_duration == BUTTON_LONG_PRESS_MS) {
-                ESP_LOGI(TAG, "Long press detected - resetting config");
-                config_reset();
-                s_restart_pending = true;
+        int level = gpio_get_level(BOOT_BUTTON_GPIO);
+        
+        if (level == 0) { // Aktiv (Low)
+            if (pressed_since < 0) {
+                pressed_since = esp_timer_get_time();
+                handled_long_press = false;
+            } else if (!handled_long_press && (esp_timer_get_time() - pressed_since) >= (int64_t)BUTTON_HOLD_SECONDS * 1000000LL) {
+                // Halten über 10 Sekunden: Config löschen und Neustart
+                ESP_LOGW(TAG, "BOOT button held >10s; clearing config");
+                clear_config_nvs();
+                handled_long_press = true;
+                vTaskDelay(pdMS_TO_TICKS(250));
+                esp_restart();
             }
-        } else {
-            if (press_duration > 0 && press_duration < BUTTON_LONG_PRESS_MS) {
-                ESP_LOGI(TAG, "Short press detected - toggling portal");
-                if (s_portal_active) {
-                    start_wifi_repeater();
-                } else {
-                    start_setup_portal();
+        } else { // Losgelassen
+            if (pressed_since > 0 && !handled_long_press) {
+                int64_t duration = esp_timer_get_time() - pressed_since;
+                if (duration > 50000LL) { // Debounce, ab 50ms ist es ein Klick
+                    ESP_LOGW(TAG, "BOOT button clicked; toggling portal mode");
+                    
+                    // Toggle des Portal-Modes im NVS speichern, damit beim Neustart geswitcht wird
+                    nvs_handle_t handle;
+                    if (nvs_open(CONFIG_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
+                        uint8_t force_portal = 0;
+                        nvs_get_u8(handle, "force_portal", &force_portal);
+                        force_portal = !force_portal; // Toggle den Status
+                        nvs_set_u8(handle, "force_portal", force_portal);
+                        nvs_commit(handle);
+                        nvs_close(handle);
+                    }
+                    
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    esp_restart(); // Neustart für Toggle ohne Löschen der Credentials!
                 }
             }
-            press_duration = 0;
+            pressed_since = -1;
         }
-
-        vTaskDelay(BUTTON_POLL_MS / portTICK_PERIOD_MS);
+        vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
     }
 }
 
-// ============================================================================
-// Main
-// ============================================================================
+static void ensure_button_task(void) {
+    if (s_button_task != NULL) {
+        return;
+    }
+    xTaskCreate(button_watch_task, "button_watch", 3072, NULL, tskIDLE_PRIORITY + 1, &s_button_task);
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+    (void)arg;
+    (void)event_base;
+    if (event_id == WIFI_EVENT_STA_START) {
+        if (s_mode == MODE_ROUTER) {
+            ESP_LOGI(TAG, "STA start -> connect");
+            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
+        }
+    } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
+        ESP_LOGW(TAG, "STA disconnected reason=%d", event ? event->reason : -1);
+        if (s_mode == MODE_ROUTER && !s_restart_pending) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
+        }
+    } else if (event_id == WIFI_EVENT_AP_STACONNECTED) {
+        wifi_event_ap_staconnected_t *event = (wifi_event_ap_staconnected_t *)event_data;
+        if (event) {
+            ESP_LOGI(TAG, "AP client connected: " MACSTR, MAC2STR(event->mac));
+        }
+    } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+        wifi_event_ap_stadisconnected_t *event = (wifi_event_ap_stadisconnected_t *)event_data;
+        if (event) {
+            ESP_LOGI(TAG, "AP client disconnected: " MACSTR, MAC2STR(event->mac));
+        }
+    }
+}
+
+static void ip_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+    (void)arg;
+    (void)event_base;
+    if (event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        if (!event) {
+            return;
+        }
+        ESP_LOGI(TAG, "STA got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        esp_netif_set_default_netif(s_sta_netif);
+#if APP_HAS_NAPT
+        if (s_ap_netif) {
+            esp_netif_ip_info_t ap_ip = { 0 };
+            if (esp_netif_get_ip_info(s_ap_netif, &ap_ip) == ESP_OK) {
+                ip_napt_enable(ap_ip.ip.addr, 1);
+                ESP_LOGI(TAG, "NAPT enabled on AP IP: " IPSTR, IP2STR(&ap_ip.ip));
+            }
+        }
+#endif
+    }
+}
+
+static void wifi_init_common(void) {
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    s_ap_netif = esp_netif_create_default_wifi_ap();
+    s_sta_netif = esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &ip_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+}
+
+static void start_config_portal(void) {
+    s_mode = MODE_CONFIG;
+    gpio_set_level(LED_BUILTIN, 1); // LED einschalten im Portal-Modus
+
+    char setup_ssid[33];
+    get_setup_ap_ssid(setup_ssid, sizeof(setup_ssid));
+    set_ap_config_from_credentials(setup_ssid, "");
+    ESP_ERROR_CHECK(esp_wifi_start());
+    start_dns_captive_task(NULL);
+    s_http_server = start_http_server();
+    ESP_LOGI(TAG, "Config AP started: %s", setup_ssid);
+}
+
+static void start_router_mode(const app_config_t *cfg) {
+    s_mode = MODE_ROUTER;
+    gpio_set_level(LED_BUILTIN, 0); // LED ausschalten im Router-Modus
+
+    wifi_log_sta_credentials(cfg);
+    set_ap_config_from_credentials(cfg->hotspot_ssid, cfg->hotspot_pass);
+    set_sta_config_from_credentials(cfg);
+    ESP_ERROR_CHECK(esp_wifi_start());
+    start_dns_proxy_task(NULL);
+    ESP_ERROR_CHECK(esp_wifi_connect());
+    ESP_LOGI(TAG, "Router mode started");
+}
 
 void app_main(void) {
-    ESP_LOGI(TAG, "Starting ESP32 WiFi Repeater");
+    esp_log_level_set("httpd_uri", ESP_LOG_WARN);
+    esp_log_level_set("httpd_txrx", ESP_LOG_WARN);
+    esp_log_level_set("httpd_parse", ESP_LOG_WARN);
+    esp_log_level_set("dns", ESP_LOG_WARN);
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase();
-        nvs_flash_init();
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ESP_ERROR_CHECK(nvs_flash_init());
+    } else {
+        ESP_ERROR_CHECK(ret);
     }
 
-    esp_netif_init();
-    esp_event_loop_create_default();
+    // LED initialisieren
+    gpio_config_t led_io = {
+        .pin_bit_mask = 1ULL << LED_BUILTIN,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&led_io);
+    gpio_set_level(LED_BUILTIN, 0); // Default Off
 
-    s_sta_netif = esp_netif_create_default_wifi_sta();
-    s_ap_netif = esp_netif_create_default_wifi_ap();
+    wifi_init_common();
+    ensure_button_task();
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
+    // Checken ob der Portal-Modus erzwungen werden soll (z.B. durch Knopf-Klick)
+    uint8_t force_portal = 0;
+    nvs_handle_t handle;
+    if (nvs_open(CONFIG_NAMESPACE, NVS_READONLY, &handle) == ESP_OK) {
+        nvs_get_u8(handle, "force_portal", &force_portal);
+        nvs_close(handle);
+    }
 
-    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
-    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL);
-
-    led_init();
-    xTaskCreate(led_blink_task, "led_blink", 1024, NULL, 1, NULL);
-    xTaskCreate(button_task, "button_task", 2048, NULL, 5, NULL);
-
-    start_setup_portal();
-
-    while (1) {
-        if (s_restart_pending) {
-            ESP_LOGI(TAG, "Restarting...");
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
-            esp_restart();
-        }
-        vTaskDelay(100 / portTICK_PERIOD_MS);
+    app_config_t cfg = { 0 };
+    if (force_portal == 0 && load_config_from_nvs(&cfg) == ESP_OK) {
+        start_router_mode(&cfg);
+    } else {
+        start_config_portal();
     }
 }
